@@ -1,0 +1,134 @@
+#!/usr/bin/ruby
+
+require 'rexml/document'
+require 'net/http'
+
+DATAPATH = '/home/martine/www/neugierig/htdocs/content/cutesideload'
+LAST_MODIFIED = DATAPATH + '/last-modified'
+OUTPUT_FILE = DATAPATH + '/cute-sideload.xml'
+UPSTREAM_URL = "http://feeds.feedburner.com/typepad/CuteOverload"
+
+# RDF 1.0 requires HTML content to be escaped.
+# This function generates the text of an escaped element.
+def escaped_element(name, attrs=nil)
+  e = REXML::Element.new name 
+  e.add_attributes attrs if attrs
+  e.to_s
+end
+
+# Given text containing some text and some images,
+# return escaped HTML containing just the images.
+# Tries to do some smart things with image sizes.
+def sanitize_text text
+  out = ''
+  text.scan(/<img (.*?)>/) do |attrs|
+    width = height = src = nil
+    attrs[0].scan(/(\w+)="(.*?)"/) do |key, val|
+      case key
+      when 'src'
+        # No image tracking urls, thanks!
+        break if val =~ %r{^http://feeds.feedburner}
+        src = val
+      when 'width'; width = val
+      when 'height'; height = val
+      when 'style'
+        # Sometimes they use CSS image sizes.
+        val.scan(/(\w+):\s*(.*?)px;/) do |key, val|
+          case key
+          when 'width'; width = val
+          when 'height'; height = val
+          end
+        end
+      end
+    end
+    if src
+      attrs = { 'src' => src }
+      if width and height
+        attrs['width'] = width
+        attrs['height'] = height
+      end
+      out += escaped_element 'img', attrs
+      out += escaped_element 'br'
+    end
+  end
+  out
+end
+
+# Transform a Cute Overload RDF item into a Cute Sideload RDF item.
+def sanitize_item(item)
+  # I love how wrong it is to use namespaces in this way, and how
+  # REXML doesn't mind.  (Where "love" is that cynical sarastic form
+  # of "hate" that has sorta wrapped back around to "am amused by".)
+  link = item.attributes['rdf:about']
+
+  item.elements.each('link') do |e|
+    e.text = link   # remove feedburner redirect.
+  end
+  item.delete_element 'feedburner:origLink'
+
+  item.delete_element 'description'
+  item.elements.each('content:encoded') do |e|
+    desc = item.add_element 'description'
+    desc.text = sanitize_text e.text
+  end
+  item.delete_element 'content:encoded'
+
+  title = ''
+  item.elements.each('dc:subject') do |e|
+    title = e.text.downcase
+  end
+  item.elements.each('title') do |e|
+    e.text = title
+  end
+end
+
+# Given input XML content, output a new sanitized document to OUTPUT_FILE.
+def rebuild(content)
+  doc = REXML::Document.new(content)
+  doc.elements.each('/rdf:RDF/channel/title') do |e|
+    e.text = 'Cute Sideload'
+  end
+  doc.elements.each('/rdf:RDF/channel/description') do |e|
+    e.text = 'Cute Overload, minus the commentary.'
+  end
+  doc.delete_element '//dc:language'
+  doc.elements.each('//item') do |item|
+    sanitize_item(item)
+  end
+  open(OUTPUT_FILE, 'w') do |f|
+    doc.write f
+  end
+end
+
+# Fetch UPSTREAM_URL, using LAST_MODIFIED.
+# Update OUTPUT_FILE if changed.
+def do_fetch
+  headers = {}
+  modified = nil
+  if File.readable? LAST_MODIFIED
+    modified = open(LAST_MODIFIED).read.strip
+    headers['If-Modified-Since'] = modified
+  end
+  uri = URI.parse(UPSTREAM_URL)
+  Net::HTTP.start(uri.host) do |http|
+    resp, content = http.get(uri.path, headers)
+    case resp.code
+    when '200'
+      new_modified = resp['last-modified']
+      if new_modified and new_modified != modified
+        open(LAST_MODIFIED, 'w').puts(new_modified)
+        rebuild(content)
+      end
+    when '304'
+      # not modified
+    else
+      puts "Got code #{resp.code} while fetching Cute Overload."
+      puts "Something wrong?"
+      exit 1
+    end
+  end
+end
+
+do_fetch
+
+# vim: set ts=2 sw=2 et :
